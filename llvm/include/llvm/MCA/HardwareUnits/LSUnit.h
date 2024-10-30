@@ -32,7 +32,31 @@ namespace mca {
 /// A Memory group identifier is then stored as a "token" in field
 /// Instruction::LSUTokenID of each dispatched instructions. That token is used
 /// internally by the LSUnit to track memory dependencies.
-class MemoryGroup {
+class AbstractMemoryGroup {
+
+public:
+  virtual ~AbstractMemoryGroup() {};
+
+  virtual size_t getNumSuccessors() const = 0;
+  virtual unsigned getNumPredecessors() const = 0;
+  virtual unsigned getNumExecutingPredecessors() const = 0;
+  virtual unsigned getNumExecutedPredecessors() const = 0;
+  virtual unsigned getNumInstructions() const = 0;
+  virtual unsigned getNumExecuting() const = 0;
+  virtual unsigned getNumExecuted() const = 0;
+
+  virtual const InstRef &getCriticalMemoryInstruction() const = 0;
+  virtual const CriticalDependency &getCriticalPredecessor() const = 0;
+
+  virtual bool isWaiting() const = 0;
+  virtual bool isPending() const = 0;
+  virtual bool isReady() const = 0;
+  virtual bool isExecuting() const = 0;
+  virtual bool isExecuted() const = 0;
+};
+
+/// The default AbstractMemoryGroup implementation used by LSUnit
+class MemoryGroup : public AbstractMemoryGroup {
   unsigned NumPredecessors = 0;
   unsigned NumExecutingPredecessors = 0;
   unsigned NumExecutedPredecessors = 0;
@@ -55,24 +79,24 @@ public:
   MemoryGroup() = default;
   MemoryGroup(MemoryGroup &&) = default;
 
-  size_t getNumSuccessors() const {
+  size_t getNumSuccessors() const override {
     return OrderSucc.size() + DataSucc.size();
   }
-  unsigned getNumPredecessors() const { return NumPredecessors; }
-  unsigned getNumExecutingPredecessors() const {
+  unsigned getNumPredecessors() const override { return NumPredecessors; }
+  unsigned getNumExecutingPredecessors() const override {
     return NumExecutingPredecessors;
   }
-  unsigned getNumExecutedPredecessors() const {
+  unsigned getNumExecutedPredecessors() const override {
     return NumExecutedPredecessors;
   }
-  unsigned getNumInstructions() const { return NumInstructions; }
-  unsigned getNumExecuting() const { return NumExecuting; }
-  unsigned getNumExecuted() const { return NumExecuted; }
+  unsigned getNumInstructions() const override { return NumInstructions; }
+  unsigned getNumExecuting() const override { return NumExecuting; }
+  unsigned getNumExecuted() const override { return NumExecuted; }
 
-  const InstRef &getCriticalMemoryInstruction() const {
+  const InstRef &getCriticalMemoryInstruction() const override {
     return CriticalMemoryInstruction;
   }
-  const CriticalDependency &getCriticalPredecessor() const {
+  const CriticalDependency &getCriticalPredecessor() const override {
     return CriticalPredecessor;
   }
 
@@ -94,20 +118,22 @@ public:
       OrderSucc.emplace_back(Group);
   }
 
-  bool isWaiting() const {
+  bool isWaiting() const override {
     return NumPredecessors >
            (NumExecutingPredecessors + NumExecutedPredecessors);
   }
-  bool isPending() const {
+  bool isPending() const override {
     return NumExecutingPredecessors &&
            ((NumExecutedPredecessors + NumExecutingPredecessors) ==
             NumPredecessors);
   }
-  bool isReady() const { return NumExecutedPredecessors == NumPredecessors; }
-  bool isExecuting() const {
+  bool isReady() const override {
+    return NumExecutedPredecessors == NumPredecessors;
+  }
+  bool isExecuting() const override {
     return NumExecuting && (NumExecuting == (NumInstructions - NumExecuted));
   }
-  bool isExecuted() const { return NumInstructions == NumExecuted; }
+  bool isExecuted() const override { return NumInstructions == NumExecuted; }
 
   void onGroupIssued(const InstRef &IR, bool ShouldUpdateCriticalDep) {
     assert(!isReady() && "Unexpected group-start event!");
@@ -214,10 +240,6 @@ class LSUnitBase : public HardwareUnit {
   /// alias with stores.
   const bool NoAlias;
 
-  /// Used to map group identifiers to MemoryGroups.
-  DenseMap<unsigned, std::unique_ptr<MemoryGroup>> Groups;
-  unsigned NextGroupID;
-
 public:
   LSUnitBase(const MCSchedModel &SM, unsigned LoadQueueSize,
              unsigned StoreQueueSize, bool AssumeNoAlias);
@@ -265,14 +287,12 @@ public:
   bool isSQFull() const { return SQSize && SQSize == UsedSQEntries; }
   bool isLQFull() const { return LQSize && LQSize == UsedLQEntries; }
 
-  bool isValidGroupID(unsigned Index) const {
-    return Index && Groups.contains(Index);
-  }
+  virtual bool isValidGroupID(unsigned Index) const = 0;
 
   /// Check if a peviously dispatched instruction IR is now ready for execution.
   bool isReady(const InstRef &IR) const {
     unsigned GroupID = IR.getInstruction()->getLSUTokenID();
-    const MemoryGroup &Group = getGroup(GroupID);
+    const AbstractMemoryGroup &Group = getAbstractGroup(GroupID);
     return Group.isReady();
   }
 
@@ -280,7 +300,7 @@ public:
   /// currently executing.
   bool isPending(const InstRef &IR) const {
     unsigned GroupID = IR.getInstruction()->getLSUTokenID();
-    const MemoryGroup &Group = getGroup(GroupID);
+    const AbstractMemoryGroup &Group = getAbstractGroup(GroupID);
     return Group.isPending();
   }
 
@@ -288,49 +308,36 @@ public:
   /// wait time is still unknown.
   bool isWaiting(const InstRef &IR) const {
     unsigned GroupID = IR.getInstruction()->getLSUTokenID();
-    const MemoryGroup &Group = getGroup(GroupID);
+    const AbstractMemoryGroup &Group = getAbstractGroup(GroupID);
     return Group.isWaiting();
   }
 
   bool hasDependentUsers(const InstRef &IR) const {
     unsigned GroupID = IR.getInstruction()->getLSUTokenID();
-    const MemoryGroup &Group = getGroup(GroupID);
+    const AbstractMemoryGroup &Group = getAbstractGroup(GroupID);
     return !Group.isExecuted() && Group.getNumSuccessors();
   }
 
-  const MemoryGroup &getGroup(unsigned Index) const {
-    assert(isValidGroupID(Index) && "Group doesn't exist!");
-    return *Groups.find(Index)->second;
-  }
+  virtual unsigned createMemoryGroup() = 0;
 
-  MemoryGroup &getGroup(unsigned Index) {
-    assert(isValidGroupID(Index) && "Group doesn't exist!");
-    return *Groups.find(Index)->second;
-  }
+  virtual const AbstractMemoryGroup &getAbstractGroup(unsigned Index) const = 0;
 
-  unsigned createMemoryGroup() {
-    Groups.insert(
-        std::make_pair(NextGroupID, std::make_unique<MemoryGroup>()));
-    return NextGroupID++;
-  }
+  virtual AbstractMemoryGroup &getAbstractGroup(unsigned Index) = 0;
 
-  virtual void onInstructionExecuted(const InstRef &IR);
+  virtual void onInstructionExecuted(const InstRef &IR) = 0;
 
   // Loads are tracked by the LDQ (load queue) from dispatch until completion.
   // Stores are tracked by the STQ (store queue) from dispatch until commitment.
   // By default we conservatively assume that the LDQ receives a load at
   // dispatch. Loads leave the LDQ at retirement stage.
-  virtual void onInstructionRetired(const InstRef &IR);
+  virtual void onInstructionRetired(const InstRef &IR) = 0;
 
-  virtual void onInstructionIssued(const InstRef &IR) {
-    unsigned GroupID = IR.getInstruction()->getLSUTokenID();
-    Groups[GroupID]->onInstructionIssued(IR);
-  }
+  virtual void onInstructionIssued(const InstRef &IR) = 0;
 
-  virtual void cycleEvent();
+  virtual void cycleEvent() = 0;
 
 #ifndef NDEBUG
-  void dump() const;
+  virtual void dump() const {};
 #endif
 };
 
@@ -439,6 +446,11 @@ class LSUnit : public LSUnitBase {
   unsigned CurrentStoreGroupID;
   unsigned CurrentStoreBarrierGroupID;
 
+protected:
+  /// Used to map group identifiers to MemoryGroups.
+  DenseMap<unsigned, std::unique_ptr<MemoryGroup>> Groups;
+  unsigned NextGroupID = 1;
+
 public:
   LSUnit(const MCSchedModel &SM)
       : LSUnit(SM, /* LQSize */ 0, /* SQSize */ 0, /* NoAlias */ false) {}
@@ -448,6 +460,34 @@ public:
       : LSUnitBase(SM, LQ, SQ, AssumeNoAlias), CurrentLoadGroupID(0),
         CurrentLoadBarrierGroupID(0), CurrentStoreGroupID(0),
         CurrentStoreBarrierGroupID(0) {}
+
+  bool isValidGroupID(unsigned Index) const override {
+    return Index && Groups.contains(Index);
+  }
+
+  const MemoryGroup &getGroup(unsigned Index) const {
+    assert(isValidGroupID(Index) && "Group doesn't exist!");
+    return *Groups.find(Index)->second;
+  }
+
+  MemoryGroup &getGroup(unsigned Index) {
+    assert(isValidGroupID(Index) && "Group doesn't exist!");
+    return *Groups.find(Index)->second;
+  }
+
+  const AbstractMemoryGroup &getAbstractGroup(unsigned Index) const override {
+    return getGroup(Index);
+  }
+
+  AbstractMemoryGroup &getAbstractGroup(unsigned Index) override {
+    assert(isValidGroupID(Index) && "Group doesn't exist!");
+    return getGroup(Index);
+  }
+
+  unsigned createMemoryGroup() override {
+    Groups.insert(std::make_pair(NextGroupID, std::make_unique<MemoryGroup>()));
+    return NextGroupID++;
+  }
 
   /// Returns LSU_AVAILABLE if there are enough load/store queue entries to
   /// accomodate instruction IR.
@@ -469,6 +509,20 @@ public:
   unsigned dispatch(const InstRef &IR) override;
 
   void onInstructionExecuted(const InstRef &IR) override;
+
+  void onInstructionRetired(const InstRef &IR) override;
+
+  void onInstructionIssued(const InstRef &IR) override {
+    unsigned GroupID = IR.getInstruction()->getLSUTokenID();
+    MemoryGroup &Group = *Groups.find(GroupID)->second;
+    Group.onInstructionIssued(IR);
+  }
+
+  void cycleEvent() override;
+
+#ifndef NDEBUG
+  virtual void dump() const override;
+#endif
 };
 
 } // namespace mca
